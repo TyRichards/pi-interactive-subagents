@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -2460,18 +2460,38 @@ describe("subagent status renderer", () => {
 });
 
 describe("subagent startup delay", () => {
-  it("defaults to 500ms when no env var is set", () => {
+  it("defaults to 500ms outside Herdr", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.getShellReadyDelayMs, "function");
 
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    const originalDelay = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    const originalHerdr = process.env.HERDR_ENV;
     delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    delete process.env.HERDR_ENV;
     try {
       assert.equal(testApi.getShellReadyDelayMs(), 500);
     } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
+      if (originalDelay == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = originalDelay;
+      if (originalHerdr == null) delete process.env.HERDR_ENV;
+      else process.env.HERDR_ENV = originalHerdr;
+    }
+  });
+
+  it("defaults to 750ms inside Herdr", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const originalDelay = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    const originalHerdr = process.env.HERDR_ENV;
+    delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    process.env.HERDR_ENV = "1";
+    try {
+      assert.equal(testApi.getShellReadyDelayMs(), 750);
+    } finally {
+      if (originalDelay == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = originalDelay;
+      if (originalHerdr == null) delete process.env.HERDR_ENV;
+      else process.env.HERDR_ENV = originalHerdr;
     }
   });
 

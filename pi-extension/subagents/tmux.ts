@@ -1,14 +1,14 @@
 /**
- * tmux surface layer — the only terminal multiplexer this extension supports.
+ * Terminal-multiplexer surface layer for tmux and Herdr.
  *
  * Everything the extension does to a pane goes through the small API in this
  * file: create/split a pane, type a command into it, read its screen, close
- * it, and poll for exit. Keeping the tmux calls isolated here means index.ts
- * stays testable without a multiplexer running.
+ * it, and poll for exit. Keeping multiplexer calls isolated here means
+ * index.ts stays testable without a multiplexer running.
  *
- * Panes are identified by tmux pane ids (e.g. `%12`). Splits always target
- * the parent pi's pane (`$TMUX_PANE`) so they follow the agent rather than
- * the user's focus.
+ * tmux panes use ids such as `%12`; Herdr panes use opaque ids such as
+ * `w3:p1H`. Creation always targets the parent Pi pane rather than whichever
+ * pane happens to be focused in another client.
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
@@ -47,18 +47,45 @@ export function isTmuxAvailable(): boolean {
   return !!process.env.TMUX && hasCommand("tmux");
 }
 
+/** True when Pi is running in a Herdr-managed pane. */
+export function isHerdrAvailable(): boolean {
+  return (
+    process.env.HERDR_ENV === "1" &&
+    !!process.env.HERDR_PANE_ID &&
+    hasCommand(process.env.HERDR_BIN_PATH || "herdr")
+  );
+}
+
 export function isMuxAvailable(): boolean {
-  return isTmuxAvailable();
+  return isHerdrAvailable() || isTmuxAvailable();
 }
 
 export function muxSetupHint(): string {
-  return "Start pi inside tmux (`tmux new -A -s pi 'pi'`).";
+  return "Start Pi inside Herdr or tmux (`tmux new -A -s pi 'pi'`).";
 }
 
-function requireTmux(): void {
-  if (!isTmuxAvailable()) {
-    throw new Error(`tmux is required for subagents. ${muxSetupHint()}`);
+function requireMux(): void {
+  if (!isMuxAvailable()) {
+    throw new Error(`A supported terminal multiplexer is required for subagents. ${muxSetupHint()}`);
   }
+}
+
+function herdrBin(): string {
+  return process.env.HERDR_BIN_PATH || "herdr";
+}
+
+function runHerdr(args: string[]): any {
+  const output = execFileSync(herdrBin(), args, { encoding: "utf8" });
+  if (!output.trim()) return null;
+  try {
+    return JSON.parse(output);
+  } catch {
+    return output;
+  }
+}
+
+function isHerdrSurface(surface: string): boolean {
+  return !surface.startsWith("%");
 }
 
 // ── Shell helpers ──
@@ -76,25 +103,29 @@ export function shellEscape(s: string): string {
  */
 const SUBAGENT_TMUX_LAYOUT = "even-horizontal";
 
+/** Herdr builds this many columns before starting the second row. */
+const HERDR_GRID_COLUMNS = Math.max(
+  1,
+  Number.parseInt(process.env.PI_SUBAGENT_HERDR_GRID_COLUMNS || "5", 10) || 5,
+);
+
 let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
+const herdrTopRow: string[] = [];
+const herdrBottomRow: string[] = [];
 
 /**
- * Re-balance subagent panes so repeated splits don't leave them lopsided.
- * tmux halves the target pane on every split and dumps freed space onto a
- * neighbor on close, so without this panes drift to wildly uneven widths.
- * Applies SUBAGENT_TMUX_LAYOUT to the parent pi window. Debounced so a burst
- * of parallel spawns or staggered exits collapses into a single layout call,
- * and non-fatal: a cosmetic resize must never break spawning or watching.
+ * Re-balance tmux panes so repeated splits don't leave them lopsided. Herdr
+ * uses explicit split ratios while surfaces are created, so it needs no
+ * equivalent post-layout command.
  */
 function rebalanceSurfaces(hintPane?: string): void {
-  // Prefer the parent pi pane (stable; survives a closing subagent pane).
+  if (!isTmuxAvailable()) return;
   const target = process.env.TMUX_PANE ?? hintPane;
   if (!target) return;
   if (rebalanceTimer) clearTimeout(rebalanceTimer);
   rebalanceTimer = setTimeout(() => {
     rebalanceTimer = null;
     try {
-      // -t <pane> resolves to that pane's window; does not change focus.
       execFileSync("tmux", ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
         encoding: "utf8",
       });
@@ -104,17 +135,203 @@ function rebalanceSurfaces(hintPane?: string): void {
   }, 120);
 }
 
+function renameHerdrSurface(surface: string, name: string): void {
+  try {
+    runHerdr(["pane", "rename", surface, `subagent: ${name}`]);
+  } catch {
+    // A label is cosmetic; failure must not prevent launch.
+  }
+}
+
+function splitHerdrSurface(
+  fromSurface: string,
+  direction: "right" | "down",
+  ratio: number,
+): string {
+  const response = runHerdr([
+    "pane",
+    "split",
+    fromSurface,
+    "--direction",
+    direction,
+    "--ratio",
+    String(ratio),
+    "--cwd",
+    process.cwd(),
+    "--no-focus",
+  ]);
+  const pane = response?.result?.pane?.pane_id;
+  if (typeof pane !== "string" || !pane) {
+    throw new Error(`Unexpected Herdr pane split response: ${JSON.stringify(response)}`);
+  }
+  return pane;
+}
+
+/**
+ * Create a full-width Herdr area below an existing two-pane top row. This is
+ * deliberately topology-aware: moving the original right pane beside the
+ * original left pane changes the root from a horizontal split into a vertical
+ * split whose top child retains the two existing panes.
+ */
+function createInitialHerdrSurface(name: string, parent: string): string {
+  let pane: string | null = null;
+  let layout: any = null;
+  let panes: any[] = [];
+  try {
+    const response = runHerdr(["pane", "layout", "--pane", parent]);
+    layout = response?.result?.layout;
+    panes = Array.isArray(layout?.panes) ? [...layout.panes] : [];
+    panes.sort((a, b) => a.rect.x - b.rect.x);
+  } catch {
+    // The generic parent split below remains available as a safe fallback.
+  }
+
+  const isTwoPaneTopRow =
+    panes.length === 2 &&
+    panes.some((item) => item.pane_id === parent) &&
+    panes[0].rect.y === panes[1].rect.y &&
+    panes[0].rect.height === panes[1].rect.height;
+
+  if (isTwoPaneTopRow) {
+    const [left, right] = panes;
+    const temporary = runHerdr([
+      "tab",
+      "create",
+      "--workspace",
+      layout.workspace_id,
+      "--cwd",
+      process.cwd(),
+      "--label",
+      `subagent-layout-${process.pid}`,
+      "--no-focus",
+    ]);
+    const temporaryTab = temporary?.result?.tab?.tab_id;
+    const temporaryRoot = temporary?.result?.root_pane?.pane_id;
+    if (!temporaryTab || !temporaryRoot) {
+      throw new Error(`Unexpected Herdr temporary tab response: ${JSON.stringify(temporary)}`);
+    }
+
+    let rightMovedOut = false;
+    let rightMovedBack = false;
+    let candidate: string | null = null;
+    try {
+      runHerdr([
+        "pane",
+        "move",
+        right.pane_id,
+        "--tab",
+        temporaryTab,
+        "--split",
+        "right",
+        "--target-pane",
+        temporaryRoot,
+        "--ratio",
+        "0.5",
+        "--no-focus",
+      ]);
+      rightMovedOut = true;
+      candidate = splitHerdrSurface(left.pane_id, "down", 0.34);
+      runHerdr([
+        "pane",
+        "move",
+        right.pane_id,
+        "--tab",
+        layout.tab_id,
+        "--split",
+        "right",
+        "--target-pane",
+        left.pane_id,
+        "--ratio",
+        "0.5",
+        right.pane_id === parent ? "--focus" : "--no-focus",
+      ]);
+      rightMovedBack = true;
+      pane = candidate;
+      runHerdr(["tab", "close", temporaryTab]);
+    } catch (error) {
+      if (rightMovedOut && !rightMovedBack) {
+        try {
+          runHerdr([
+            "pane",
+            "move",
+            right.pane_id,
+            "--tab",
+            layout.tab_id,
+            "--split",
+            "right",
+            "--target-pane",
+            left.pane_id,
+            "--ratio",
+            "0.5",
+            right.pane_id === parent ? "--focus" : "--no-focus",
+          ]);
+          rightMovedBack = true;
+        } catch {}
+      }
+      if (candidate) {
+        try {
+          runHerdr(["pane", "close", candidate]);
+        } catch {}
+      }
+      if (rightMovedBack) {
+        try {
+          runHerdr(["tab", "close", temporaryTab]);
+        } catch {}
+      }
+      throw error;
+    }
+  }
+
+  // Generic fallback: reserve the lower two-thirds beneath the parent pane.
+  pane ??= splitHerdrSurface(parent, "down", 0.34);
+  herdrTopRow.push(pane);
+  renameHerdrSurface(pane, name);
+  return pane;
+}
+
+function createHerdrSurface(name: string): string {
+  const parent = process.env.HERDR_PANE_ID;
+  if (!parent) throw new Error("HERDR_PANE_ID is required to create a Herdr subagent pane");
+
+  if (herdrTopRow.length === 0) {
+    return createInitialHerdrSurface(name, parent);
+  }
+
+  if (herdrTopRow.length < HERDR_GRID_COLUMNS) {
+    const remainder = herdrTopRow[herdrTopRow.length - 1];
+    const remainingColumns = HERDR_GRID_COLUMNS - herdrTopRow.length + 1;
+    const pane = splitHerdrSurface(remainder, "right", 1 / remainingColumns);
+    herdrTopRow.push(pane);
+    renameHerdrSurface(pane, name);
+    return pane;
+  }
+
+  if (herdrBottomRow.length < HERDR_GRID_COLUMNS) {
+    const pane = splitHerdrSurface(herdrTopRow[herdrBottomRow.length], "down", 0.5);
+    herdrBottomRow.push(pane);
+    renameHerdrSurface(pane, name);
+    return pane;
+  }
+
+  // More than two rows: continue downward in column order.
+  const all = [...herdrTopRow, ...herdrBottomRow];
+  const target = all[(all.length - HERDR_GRID_COLUMNS * 2) % HERDR_GRID_COLUMNS];
+  const pane = splitHerdrSurface(target, "down", 0.5);
+  herdrBottomRow.push(pane);
+  renameHerdrSurface(pane, name);
+  return pane;
+}
+
 // ── Surface primitives ──
 
 /**
- * Create a new pane for a subagent: a right split off the parent pi's pane,
- * so new panes follow the agent rather than the user's focus.
- * See https://github.com/HazAT/pi-interactive-subagents/issues/12
- *
- * Returns the new pane id (e.g. `%12`).
+ * Create a new pane for a subagent. Herdr places panes in a grid below the
+ * parent area; tmux creates a right split and then rebalances the window.
+ * Creation never follows another client's focus.
  */
 export function createSurface(name: string): string {
-  void name; // tmux panes are not named; the pi process inside shows its own title.
+  requireMux();
+  if (isHerdrAvailable()) return createHerdrSurface(name);
   return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
 }
 
@@ -127,8 +344,19 @@ export function createSurfaceSplit(
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): string {
-  void name;
-  requireTmux();
+  requireMux();
+
+  if (isHerdrAvailable()) {
+    const parent = fromSurface ?? process.env.HERDR_PANE_ID;
+    if (!parent) throw new Error("HERDR_PANE_ID is required to split a Herdr pane");
+    const nativeDirection = direction === "left" ? "right" : direction === "up" ? "down" : direction;
+    const pane = splitHerdrSurface(parent, nativeDirection, 0.5);
+    if (direction === "left" || direction === "up") {
+      runHerdr(["pane", "swap", "--source-pane", pane, "--target-pane", parent]);
+    }
+    renameHerdrSurface(pane, name);
+    return pane;
+  }
 
   const args = ["split-window", "-d"];
   if (direction === "left" || direction === "right") {
@@ -159,7 +387,11 @@ export function createSurfaceSplit(
  * then submitted with Enter.
  */
 export function sendCommand(surface: string, command: string): void {
-  requireTmux();
+  requireMux();
+  if (isHerdrSurface(surface)) {
+    runHerdr(["pane", "run", surface, command]);
+    return;
+  }
   execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
   execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
 }
@@ -206,13 +438,18 @@ export function sendLongCommand(
  * Read the screen contents of a pane (sync).
  */
 export function readScreen(surface: string, lines = 50): string {
-  requireTmux();
+  requireMux();
+  if (isHerdrSurface(surface)) {
+    return execFileSync(
+      herdrBin(),
+      ["pane", "read", surface, "--source", "recent-unwrapped", "--lines", String(Math.max(1, lines))],
+      { encoding: "utf8" },
+    );
+  }
   return execFileSync(
     "tmux",
     ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
-    {
-      encoding: "utf8",
-    },
+    { encoding: "utf8" },
   );
 }
 
@@ -220,12 +457,12 @@ export function readScreen(surface: string, lines = 50): string {
  * Read the screen contents of a pane (async).
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
-  requireTmux();
-  const { stdout } = await execFileAsync(
-    "tmux",
-    ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
-    { encoding: "utf8" },
-  );
+  requireMux();
+  const command = isHerdrSurface(surface) ? herdrBin() : "tmux";
+  const args = isHerdrSurface(surface)
+    ? ["pane", "read", surface, "--source", "recent-unwrapped", "--lines", String(Math.max(1, lines))]
+    : ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`];
+  const { stdout } = await execFileAsync(command, args, { encoding: "utf8" });
   return stdout;
 }
 
@@ -233,7 +470,11 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  * Close a pane.
  */
 export function closeSurface(surface: string): void {
-  requireTmux();
+  requireMux();
+  if (isHerdrSurface(surface)) {
+    runHerdr(["pane", "close", surface]);
+    return;
+  }
   execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
   rebalanceSurfaces();
 }

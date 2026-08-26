@@ -1,7 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
-import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
+import { Type, type Static } from "typebox";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -500,7 +500,8 @@ function widgetIcon(kind: StatusSnapshot["kind"]): string {
 function getShellReadyDelayMs(): number {
   const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
+  const defaultDelay = process.env.HERDR_ENV === "1" ? 750 : 500;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : defaultDelay;
 }
 
 function muxUnavailableResult() {
@@ -508,10 +509,10 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require tmux. ${muxSetupHint()}`,
+        text: `Subagents require Herdr or tmux. ${muxSetupHint()}`,
       },
     ],
-    details: { error: "tmux not available" },
+    details: { error: "supported multiplexer not available" },
   };
 }
 

@@ -1,12 +1,12 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Ty Richards's fork of async subagents for [pi](https://github.com/badlogic/pi-mono), running in native Herdr or tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+This fork adds native Herdr pane control and retains tmux support. It is maintained for the `pi-mega-brief` package. See [Acknowledgements](#acknowledgements) for the original project and the tmux fork this work builds upon.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own multiplexer pane without stealing keyboard focus. In Herdr, panes are placed in a grid below the parent area; in tmux, each pane begins as a right split from the parent Pi pane. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,19 +17,19 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+tmux panes are kept evenly sized by re-applying an `even-horizontal` layout after every spawn and exit (debounced). The layout is the `SUBAGENT_TMUX_LAYOUT` constant in `pi-extension/subagents/tmux.ts`. Herdr uses explicit split ratios and defaults to five columns before beginning a second row; set `PI_SUBAGENT_HERDR_GRID_COLUMNS` before starting Pi to change that column count.
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
 ```bash
-export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
+export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # defaults: Herdr 750, tmux 500
 ```
 
 ## Tools
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
+| `subagent` | Spawn a sub-agent in a dedicated Herdr or tmux pane (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -178,7 +178,9 @@ Status display is configured via `config.json` in the extension directory (copy 
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono)
-- [tmux](https://github.com/tmux/tmux)
+- Herdr or [tmux](https://github.com/tmux/tmux)
+
+Start Pi inside a Herdr pane, or use tmux:
 
 ```bash
 tmux new -A -s pi 'pi'
@@ -186,7 +188,7 @@ tmux new -A -s pi 'pi'
 
 ## Acknowledgements
 
-Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
+This fork builds on [Amos Blomqvist's tmux fork](https://github.com/amosblomqvist/pi-interactive-subagents) of [HazAT's original pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents). HazAT originated the subagent architecture, multi-multiplexer surface layer, and status widget. The supervision features were inspired by [RepoPrompt](https://repoprompt.com/). Their work remains available under the bundled MIT license.
 
 ## License
 
