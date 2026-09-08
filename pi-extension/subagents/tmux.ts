@@ -13,7 +13,7 @@
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 const execFileAsync = promisify(execFile);
@@ -108,6 +108,89 @@ const HERDR_GRID_COLUMNS = Math.max(
   1,
   Number.parseInt(process.env.PI_SUBAGENT_HERDR_GRID_COLUMNS || "5", 10) || 5,
 );
+
+export interface HerdrRoute {
+  workspace: string;
+  tab: string;
+}
+
+interface HerdrLayoutPane {
+  pane_id: string;
+  rect: { width: number; height: number };
+}
+
+interface HerdrLivePane {
+  pane_id: string;
+  agent?: string;
+}
+
+/**
+ * Parse the optional dedicated-tab route. Environment variables override the
+ * shared user config so one process can opt out or point elsewhere without
+ * editing the machine-wide policy.
+ */
+export function parseHerdrRoute(
+  rawConfig: unknown,
+  env: NodeJS.ProcessEnv = process.env,
+): HerdrRoute | null {
+  const config = rawConfig && typeof rawConfig === "object" && !Array.isArray(rawConfig)
+    ? rawConfig as Record<string, unknown>
+    : {};
+  const herdr = config.herdr && typeof config.herdr === "object" && !Array.isArray(config.herdr)
+    ? config.herdr as Record<string, unknown>
+    : {};
+  const workspace = (env.PI_SUBAGENT_HERDR_WORKSPACE ?? herdr.workspace)?.toString().trim();
+  const tab = (env.PI_SUBAGENT_HERDR_TAB ?? herdr.tab)?.toString().trim();
+
+  if (!workspace && !tab) return null;
+  if (!workspace || !tab) {
+    throw new Error(
+      "Dedicated Herdr subagent routing requires both a workspace and tab " +
+      "(PI_SUBAGENT_HERDR_WORKSPACE/PI_SUBAGENT_HERDR_TAB or shared config).",
+    );
+  }
+  return { workspace, tab };
+}
+
+function loadHerdrRoute(): HerdrRoute | null {
+  const configPath = process.env.PI_SUBAGENT_CONFIG_PATH || join(
+    process.env.XDG_CONFIG_HOME || join(homedir(), ".config"),
+    "pi-interactive-subagents",
+    "config.json",
+  );
+  let rawConfig: unknown = {};
+  if (existsSync(configPath)) {
+    try {
+      rawConfig = JSON.parse(readFileSync(configPath, "utf8"));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Invalid interactive-subagents config ${configPath}: ${detail}`);
+    }
+  }
+  return parseHerdrRoute(rawConfig);
+}
+
+/** Choose the largest current pane so a shared dynamic tab stays balanced. */
+export function selectHerdrSplitPane(
+  layoutPanes: HerdrLayoutPane[],
+  livePanes: HerdrLivePane[],
+): { paneId: string; direction: "right" | "down" } {
+  if (layoutPanes.length === 0) throw new Error("Dedicated Herdr subagent tab has no panes");
+  const liveById = new Map(livePanes.map((pane) => [pane.pane_id, pane]));
+  const ordered = [...layoutPanes].sort((a, b) => {
+    const areaDelta = b.rect.width * b.rect.height - a.rect.width * a.rect.height;
+    if (areaDelta !== 0) return areaDelta;
+    const aOccupied = liveById.get(a.pane_id)?.agent ? 1 : 0;
+    const bOccupied = liveById.get(b.pane_id)?.agent ? 1 : 0;
+    if (aOccupied !== bOccupied) return aOccupied - bOccupied;
+    return a.pane_id.localeCompare(b.pane_id);
+  });
+  const target = ordered[0];
+  return {
+    paneId: target.pane_id,
+    direction: target.rect.width >= target.rect.height * 1.6 ? "right" : "down",
+  };
+}
 
 let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
 const herdrTopRow: string[] = [];
@@ -289,9 +372,73 @@ function createInitialHerdrSurface(name: string, parent: string): string {
   return pane;
 }
 
+function createRoutedHerdrSurface(name: string, route: HerdrRoute): string {
+  const workspaceResponse = runHerdr(["workspace", "list"]);
+  const workspaces = workspaceResponse?.result?.workspaces;
+  const workspaceMatches = Array.isArray(workspaces)
+    ? workspaces.filter((workspace: any) => workspace?.workspace_id === route.workspace || workspace?.label === route.workspace)
+    : [];
+  if (workspaceMatches.length !== 1) {
+    throw new Error(
+      `Dedicated Herdr workspace "${route.workspace}" matched ${workspaceMatches.length} workspaces`,
+    );
+  }
+  const workspaceId = workspaceMatches[0].workspace_id;
+
+  const tabsResponse = runHerdr(["tab", "list", "--workspace", workspaceId]);
+  const tabs = tabsResponse?.result?.tabs;
+  let tabMatches = Array.isArray(tabs)
+    ? tabs.filter((tab: any) => tab?.tab_id === route.tab || tab?.label === route.tab)
+    : [];
+  if (tabMatches.length === 0) {
+    const anchorCwd = join(homedir(), ".local", "state", "pi-interactive-subagents");
+    mkdirSync(anchorCwd, { recursive: true });
+    const created = runHerdr([
+      "tab",
+      "create",
+      "--workspace",
+      workspaceId,
+      "--cwd",
+      anchorCwd,
+      "--label",
+      route.tab,
+      "--no-focus",
+    ]);
+    const tab = created?.result?.tab;
+    if (!tab?.tab_id) {
+      throw new Error(`Unexpected Herdr tab creation response: ${JSON.stringify(created)}`);
+    }
+    tabMatches = [tab];
+  }
+  if (tabMatches.length !== 1) {
+    throw new Error(`Dedicated Herdr tab "${route.tab}" matched ${tabMatches.length} tabs`);
+  }
+  const tabId = tabMatches[0].tab_id;
+
+  const panesResponse = runHerdr(["pane", "list", "--workspace", workspaceId]);
+  const livePanes = Array.isArray(panesResponse?.result?.panes)
+    ? panesResponse.result.panes.filter((pane: any) => pane?.tab_id === tabId)
+    : [];
+  if (livePanes.length === 0) {
+    throw new Error(`Dedicated Herdr tab "${route.tab}" has no panes`);
+  }
+  const layoutResponse = runHerdr(["pane", "layout", "--pane", livePanes[0].pane_id]);
+  const layoutPanes = layoutResponse?.result?.layout?.panes;
+  if (!Array.isArray(layoutPanes)) {
+    throw new Error(`Unexpected Herdr pane layout response: ${JSON.stringify(layoutResponse)}`);
+  }
+  const target = selectHerdrSplitPane(layoutPanes, livePanes);
+  const pane = splitHerdrSurface(target.paneId, target.direction, 0.5);
+  renameHerdrSurface(pane, name);
+  return pane;
+}
+
 function createHerdrSurface(name: string): string {
   const parent = process.env.HERDR_PANE_ID;
   if (!parent) throw new Error("HERDR_PANE_ID is required to create a Herdr subagent pane");
+
+  const route = loadHerdrRoute();
+  if (route) return createRoutedHerdrSurface(name, route);
 
   if (herdrTopRow.length === 0) {
     return createInitialHerdrSurface(name, parent);

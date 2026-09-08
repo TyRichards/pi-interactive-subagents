@@ -17,7 +17,22 @@ This fork adds native Herdr pane control and retains tmux support. It is maintai
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-tmux panes are kept evenly sized by re-applying an `even-horizontal` layout after every spawn and exit (debounced). The layout is the `SUBAGENT_TMUX_LAYOUT` constant in `pi-extension/subagents/tmux.ts`. Herdr uses explicit split ratios and defaults to five columns before beginning a second row; set `PI_SUBAGENT_HERDR_GRID_COLUMNS` before starting Pi to change that column count.
+tmux panes are kept evenly sized by re-applying an `even-horizontal` layout after every spawn and exit (debounced). The layout is the `SUBAGENT_TMUX_LAYOUT` constant in `pi-extension/subagents/tmux.ts`. By default, Herdr uses explicit split ratios in the caller's tab and starts a second row after five columns; set `PI_SUBAGENT_HERDR_GRID_COLUMNS` before starting Pi to change that column count.
+
+### Dedicated Herdr tab
+
+Herdr subagents can be routed away from every parent agent into one shared tab. Create `~/.config/pi-interactive-subagents/config.json`:
+
+```json
+{
+  "herdr": {
+    "workspace": "BC Team",
+    "tab": "subagents"
+  }
+}
+```
+
+The workspace and tab may be labels or IDs. If the workspace exists but the tab does not, the extension creates the tab without stealing focus. Every spawn splits the largest pane in that tab, so concurrent parents share a balanced, dedicated subagent area. The tab keeps one shell anchor, while completed child panes close normally. Per-process environment variables `PI_SUBAGENT_HERDR_WORKSPACE` and `PI_SUBAGENT_HERDR_TAB` override the shared config; set both together.
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 

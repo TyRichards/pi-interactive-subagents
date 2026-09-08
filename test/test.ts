@@ -30,7 +30,11 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import {
+  parseHerdrRoute,
+  selectHerdrSplitPane,
+  shellEscape,
+} from "../pi-extension/subagents/tmux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -219,6 +223,58 @@ const TOOL_RESULT = {
 };
 
 // --- Tests ---
+
+describe("dedicated Herdr routing", () => {
+  it("loads a complete route from shared config", () => {
+    assert.deepEqual(
+      parseHerdrRoute({ herdr: { workspace: "BC Team", tab: "subagents" } }, {}),
+      { workspace: "BC Team", tab: "subagents" },
+    );
+  });
+
+  it("lets environment variables override shared config", () => {
+    assert.deepEqual(
+      parseHerdrRoute(
+        { herdr: { workspace: "Old", tab: "old" } },
+        { PI_SUBAGENT_HERDR_WORKSPACE: "BC Team", PI_SUBAGENT_HERDR_TAB: "subagents" },
+      ),
+      { workspace: "BC Team", tab: "subagents" },
+    );
+  });
+
+  it("rejects a partial dedicated route", () => {
+    assert.throws(
+      () => parseHerdrRoute({ herdr: { workspace: "BC Team" } }, {}),
+      /requires both a workspace and tab/,
+    );
+  });
+
+  it("chooses the largest pane and splits according to its shape", () => {
+    assert.deepEqual(
+      selectHerdrSplitPane(
+        [
+          { pane_id: "w1:p1", rect: { width: 40, height: 20 } },
+          { pane_id: "w1:p2", rect: { width: 90, height: 20 } },
+        ],
+        [{ pane_id: "w1:p1" }, { pane_id: "w1:p2", agent: "pi" }],
+      ),
+      { paneId: "w1:p2", direction: "right" },
+    );
+  });
+
+  it("prefers the unoccupied pane when areas tie", () => {
+    assert.deepEqual(
+      selectHerdrSplitPane(
+        [
+          { pane_id: "w1:p1", rect: { width: 40, height: 40 } },
+          { pane_id: "w1:p2", rect: { width: 40, height: 40 } },
+        ],
+        [{ pane_id: "w1:p1", agent: "pi" }, { pane_id: "w1:p2" }],
+      ),
+      { paneId: "w1:p2", direction: "down" },
+    );
+  });
+});
 
 describe("session.ts", () => {
   let dir: string;
