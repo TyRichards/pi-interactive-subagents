@@ -63,7 +63,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | `agent` | string | required | Which agent to spawn (must be known and permitted) |
 | `task` | string | required | Task prompt |
 | `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
-| `model` | string | agent's model | Override the model for this spawn |
+| `model` | string | parent's active model | Override the model for this spawn; unavailable overrides are rejected before creating a pane |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 
 ### Messaging
@@ -91,11 +91,29 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **scout** | inherits parent | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
+| **researcher** | inherits parent | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **worker** | inherits parent | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
 
-All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
+All three inherit the parent session's exact active provider and model, while keeping role-specific thinking levels (`low`, `medium`, and `high`). This avoids requiring every isolated Pi runtime to authenticate a second provider. They are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
+
+### Model inheritance and overrides
+
+Model selection follows this order:
+
+1. One-off `model` passed to `subagent(...)`.
+2. `model:` in the selected agent definition.
+3. The parent session's active `provider/model`.
+
+Before creating a Herdr or tmux pane, the extension checks that the resolved model is available with authenticated credentials in the parent Pi runtime. An unavailable agent default or one-off override returns an error without leaving a dead pane. Saved sessions are checked again before resume.
+
+To change a role's default in the future, edit its definition:
+
+- Package defaults: `agents/scout.md`, `agents/researcher.md`, `agents/worker.md`
+- Runtime override: `$PI_CODING_AGENT_DIR/agents/<name>.md`
+- Project override: `.pi/agents/<name>.md`
+
+Omit `model:` to inherit the parent. Add a full model reference such as `model: openai-codex/gpt-5.6-sol` to pin that role. Project definitions override runtime definitions, which override package defaults. Use the `model` tool argument only for a one-off spawn.
 
 ## Custom agents
 
@@ -105,7 +123,7 @@ Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global).
 ---
 name: my-agent
 description: Does something specific
-model: openrouter/z-ai/glm-5.3
+# Omit model to inherit the parent session's active model.
 thinking: medium
 tools: read, edit, write, safe_bash, web_search
 session-mode: lineage-only
@@ -121,7 +139,7 @@ You are a specialized agent that does X...
 | ----- | ---- | ----------- |
 | `name` | string | Agent name (used in `agent: "my-agent"`) |
 | `description` | string | Shown in `subagents_list` |
-| `model` | string | Default model |
+| `model` | string | Optional pinned default model. Omit it to inherit the parent session's active model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |

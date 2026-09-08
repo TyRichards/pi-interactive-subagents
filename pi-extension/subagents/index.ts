@@ -105,7 +105,13 @@ const SubagentParams = Type.Object({
         "Has no effect on which agent runs — use `agent` for that.",
     }),
   ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  model: Type.Optional(
+    Type.String({
+      description:
+        "Model override. When omitted, the subagent inherits the parent session's active model. " +
+        "Unavailable overrides are rejected before a pane is created.",
+    }),
+  ),
   cwd: Type.Optional(
     Type.String({
       description:
@@ -416,6 +422,50 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   }
 
   return null;
+}
+
+const THINKING_LEVEL_SUFFIX = /:(?:off|minimal|low|medium|high|xhigh|max)$/;
+
+type ModelIdentity = { provider: string; id: string };
+type SubagentModelContext = Pick<ExtensionContext, "model" | "modelRegistry">;
+
+/** Match a CLI model spec against models with resolved authentication. */
+function modelSpecIsAvailable(
+  modelSpec: string,
+  availableModels: ReadonlyArray<ModelIdentity>,
+): boolean {
+  const normalized = modelSpec.replace(THINKING_LEVEL_SUFFIX, "");
+  const slash = normalized.indexOf("/");
+  if (slash < 0) {
+    return availableModels.some((model) => model.id === normalized);
+  }
+  const provider = normalized.slice(0, slash);
+  const id = normalized.slice(slash + 1);
+  return availableModels.some((model) => model.provider === provider && model.id === id);
+}
+
+/**
+ * Resolve the child model before creating a pane.
+ *
+ * Bundled roles omit `model`, so they inherit the exact active parent model.
+ * Custom/profile defaults and one-off overrides remain supported, but fail
+ * closed before launch when their provider is not authenticated.
+ */
+function resolveEffectiveModel(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+  ctx: SubagentModelContext,
+): string {
+  const inheritedModel = `${ctx.model.provider}/${ctx.model.id}`;
+  const effectiveModel = params.model ?? agentDefs?.model ?? inheritedModel;
+  if (!modelSpecIsAvailable(effectiveModel, ctx.modelRegistry.getAvailable())) {
+    const source = params.model ? "override" : agentDefs?.model ? "agent default" : "parent model";
+    throw new Error(
+      `Cannot spawn ${params.agent}: ${source} "${effectiveModel}" is unavailable in this Pi runtime. ` +
+        `No pane was created. Omit the model override to inherit the active parent model, or authenticate that provider first.`,
+    );
+  }
+  return effectiveModel;
 }
 
 function formatElapsed(seconds: number): string {
@@ -1129,6 +1179,8 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  modelSpecIsAvailable,
+  resolveEffectiveModel,
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
@@ -1168,14 +1220,14 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: Pick<ExtensionContext, "sessionManager" | "cwd" | "model" | "modelRegistry">,
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const effectiveModel = resolveEffectiveModel(params, agentDefs, ctx);
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -1977,7 +2029,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const lines = list.map((a) => {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";
-          const model = a.model ? ` [${a.model}]` : "";
+          const model = a.model ? ` [${a.model}]` : " [inherits parent model]";
           return `• ${a.name}${badge}${model}${desc}`;
         });
 
@@ -1996,7 +2048,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const lines = agents.map((a: any) => {
           const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
           const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
-          const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
+          const model = theme.fg(
+            "dim",
+            a.model ? ` [${a.model}]` : " [inherits parent model]",
+          );
           return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
         });
         return new Text(lines.join("\n"), 0, 0);
@@ -2140,6 +2195,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `(it predates sandboxed resume, or its .loadout.json sidecar was removed). ` +
             `Resuming would relaunch with all global extensions and the full toolset, so this is refused. ` +
             `Re-run the task as a fresh subagent instead.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        if (loadout.model && !modelSpecIsAvailable(loadout.model, ctx.modelRegistry.getAvailable())) {
+          const err =
+            `Cannot resume "${requestedName}": its saved model "${loadout.model}" is unavailable ` +
+            `in this Pi runtime. No pane was created. Spawn a fresh subagent to inherit the active parent model.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 

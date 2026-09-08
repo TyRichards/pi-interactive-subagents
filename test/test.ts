@@ -1240,6 +1240,57 @@ describe("subagent discovery", () => {
     }
   });
 
+  it("bundled roles inherit the parent model and keep role-specific thinking", () => {
+    const expectedThinking: Record<string, string> = {
+      scout: "low",
+      researcher: "medium",
+      worker: "high",
+    };
+    for (const [name, thinking] of Object.entries(expectedThinking)) {
+      const defs = testApi.loadAgentDefaults(name);
+      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+      assert.equal(defs.model, undefined, `${name} should inherit the parent model`);
+      assert.equal(defs.thinking, thinking);
+    }
+  });
+
+  it("resolves inherited and explicit models only when authenticated", () => {
+    const available = [
+      { provider: "openai-codex", id: "gpt-5.6-sol" },
+      { provider: "anthropic", id: "claude-sonnet-4-6" },
+    ];
+    const ctx = {
+      model: available[0],
+      modelRegistry: { getAvailable: () => available },
+    };
+
+    assert.equal(
+      testApi.resolveEffectiveModel({ agent: "scout", task: "map it" }, {}, ctx),
+      "openai-codex/gpt-5.6-sol",
+    );
+    assert.equal(
+      testApi.resolveEffectiveModel(
+        { agent: "scout", task: "map it", model: "anthropic/claude-sonnet-4-6" },
+        {},
+        ctx,
+      ),
+      "anthropic/claude-sonnet-4-6",
+    );
+    assert.equal(
+      testApi.modelSpecIsAvailable("openai-codex/gpt-5.6-sol:high", available),
+      true,
+    );
+    assert.throws(
+      () =>
+        testApi.resolveEffectiveModel(
+          { agent: "worker", task: "build it", model: "openrouter/z-ai/glm-5.3" },
+          {},
+          ctx,
+        ),
+      /unavailable.*No pane was created/i,
+    );
+  });
+
   it("worker is granted the spawning toolset restricted to scout and researcher", () => {
     const worker = testApi.loadAgentDefaults("worker");
     assert.ok(worker, "expected bundled worker to be discoverable");
