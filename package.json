@@ -1,6 +1,6 @@
 {
   "name": "pi-interactive-subagents",
-  "version": "3.8.0-herdr.3",
+  "version": "3.9.0-herdr.1",
   "description": "Ty Richards fork of interactive subagents for Pi with native Herdr and tmux panes",
   "keywords": [
     "pi-package"
