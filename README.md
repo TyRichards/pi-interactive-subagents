@@ -66,6 +66,26 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | `model` | string | parent's active model | Override the model for this spawn; unavailable overrides are rejected before creating a pane |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 
+### Programmatic detached API
+
+Trusted Pi extensions can launch isolated work without creating parent-LLM turns through the process-global API. It is available after this extension loads; `spawnDetached` requires an active persistent Pi session.
+
+```typescript
+const subagents = (globalThis as any).__pi_interactive_subagents;
+const handle = await subagents.spawnDetached({
+  agent: "basecamp-worker",
+  name: "basecamp-assignment-123",
+  task: "Execute Basecamp assignment 123 from the supplied authorized envelope.",
+});
+
+const result = await handle.result;
+// handle: { id, name, sessionFile, result }
+```
+
+`spawnDetached(params)` accepts the same `agent`, `task`, `name`, `model`, and `cwd` fields as `subagent`. It uses the active parent context, profile discovery, inherited model/authentication preflight, Herdr/tmux routing, sandbox/loadout snapshot, registry, watcher, and cleanup paths. Detached children do **not** send completion, status, or question steer messages into the parent LLM and do not appear as full rows in the normal subagent widget. Restricted detached profiles also omit `ask_question`, because there is no parent-turn question channel.
+
+`cancel(name)` aborts and closes the exact currently running child and returns `true`; it returns `false` when no exact running name exists. `registerToolExtension(name, path)` remains available on the same object. The facade is stable across `/reload` and dispatches only to the current active session, so retained references cannot control a replaced session.
+
 ### Messaging
 
 `subagent_message` is addressed **by name only**. Names are unique per session and persist after a sub-agent finishes, so the same name works either way:
@@ -94,8 +114,9 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 | **scout** | inherits parent | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
 | **researcher** | inherits parent | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
 | **worker** | inherits parent | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **basecamp-worker** | inherits parent | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` | Executes one Basecamp assignment with `basecamp-agent` and `basecamp`; never delegates |
 
-All three inherit the parent session's exact active provider and model, while keeping role-specific thinking levels (`low`, `medium`, and `high`). This avoids requiring every isolated Pi runtime to authenticate a second provider. They are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
+All four inherit the parent session's exact active provider and model, while keeping role-specific thinking levels (`low`, `medium`, and `high`). This avoids requiring every isolated Pi runtime to authenticate a second provider. They are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). `basecamp-worker` uses only the inherited `BASECAMP_PROFILE`, posts exactly one required final reply on its assigned item, and has no nested-subagent grant.
 
 ### Model inheritance and overrides
 

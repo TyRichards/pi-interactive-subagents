@@ -70,6 +70,10 @@ const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
+const PUBLIC_RUNTIME_KEY = Symbol.for("pi-subagents/public-runtime");
+const EXTRA_TOOL_EXTENSIONS_KEY = Symbol.for("pi-subagents/extra-tool-extensions");
+
+let moduleAbortController = new AbortController();
 
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
@@ -84,11 +88,18 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
   }
   const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
   if (prevAbort) prevAbort.abort();
-  (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+  (globalThis as any)[POLL_ABORT_KEY] = moduleAbortController;
+
+  // Invalidate the prior generation immediately. The stable public facade is
+  // installed below, but it must not dispatch into the old session during the
+  // narrow window between module evaluation and extension initialization.
+  const prevRuntime = (globalThis as any)[PUBLIC_RUNTIME_KEY];
+  if (prevRuntime) prevRuntime.active = false;
+  delete (globalThis as any)[PUBLIC_RUNTIME_KEY];
 }
 
 function getModuleAbortSignal(): AbortSignal {
-  return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
+  return moduleAbortController.signal;
 }
 
 const SubagentParams = Type.Object({
@@ -182,7 +193,9 @@ function getAgentConfigDir(): string {
 // here at load/session_start time so a child process can be launched with
 // `--no-extensions` + an explicit `-e <path>` for it. Mirrors the legacy
 // `subagents` extension's `registerToolExtension` hook.
-const EXTRA_TOOL_EXTENSIONS = new Map<string, string>();
+const EXTRA_TOOL_EXTENSIONS: Map<string, string> =
+  (globalThis as any)[EXTRA_TOOL_EXTENSIONS_KEY] ?? new Map<string, string>();
+(globalThis as any)[EXTRA_TOOL_EXTENSIONS_KEY] = EXTRA_TOOL_EXTENSIONS;
 
 /** Register (or re-register) a custom tool's backing extension file. */
 export function registerToolExtension(name: string, extensionPath: string): void {
@@ -202,12 +215,50 @@ export function registerToolExtension(name: string, extensionPath: string): void
   EXTRA_TOOL_EXTENSIONS.set(name, extensionPath);
 }
 
-// Expose registration on a process-global so project-local extensions loaded
-// via jiti (separate module instances) can reach this shared map. Set at module
-// load so it's available before any `session_start` listener runs.
-(globalThis as any).__pi_interactive_subagents = {
-  registerToolExtension,
-};
+export interface DetachedSubagentParams {
+  agent: string;
+  task: string;
+  name?: string;
+  model?: string;
+  cwd?: string;
+}
+
+export interface DetachedSubagentHandle {
+  id: string;
+  name: string;
+  sessionFile: string;
+  result: Promise<SubagentResult>;
+}
+
+export interface InteractiveSubagentsProgrammaticApi {
+  registerToolExtension(name: string, extensionPath: string): void;
+  spawnDetached(params: DetachedSubagentParams): Promise<DetachedSubagentHandle>;
+  cancel(name: string): boolean;
+}
+
+interface PublicRuntime {
+  active: boolean;
+  spawnDetached(params: DetachedSubagentParams): Promise<DetachedSubagentHandle>;
+  cancel(name: string): boolean;
+}
+
+function currentPublicRuntime(): PublicRuntime {
+  const runtime = (globalThis as any)[PUBLIC_RUNTIME_KEY] as PublicRuntime | undefined;
+  if (!runtime?.active) {
+    throw new Error("No active Pi session is available for detached subagents.");
+  }
+  return runtime;
+}
+
+// Keep one stable facade object for the life of the process. Its methods look
+// up the current runtime on every call, so references retained by trusted
+// extensions across /reload cannot invoke stale session closures.
+const processGlobalApi = ((globalThis as any).__pi_interactive_subagents ?? {}) as
+  Partial<InteractiveSubagentsProgrammaticApi>;
+processGlobalApi.registerToolExtension = registerToolExtension;
+processGlobalApi.spawnDetached = async (params) => currentPublicRuntime().spawnDetached(params);
+processGlobalApi.cancel = (name) => currentPublicRuntime().cancel(name);
+(globalThis as any).__pi_interactive_subagents = processGlobalApi;
 
 /**
  * Map a custom (non-built-in) tool name to the pi-extension file that
@@ -630,7 +681,7 @@ function resolveResultPresentation(
 /**
  * Result from running a single subagent.
  */
-interface SubagentResult {
+export interface SubagentResult {
   name: string;
   task: string;
   summary: string;
@@ -677,6 +728,8 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /** Programmatic children are watched and cleaned up but stay out of parent UI/LLM delivery. */
+  detached?: boolean;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -797,10 +850,15 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
   return lines;
 }
 
+function visibleRunningSubagents(): RunningSubagent[] {
+  return Array.from(runningSubagents.values()).filter((running) => !running.detached);
+}
+
 function updateWidget() {
   if (!latestCtx?.hasUI) return;
 
-  if (runningSubagents.size === 0) {
+  const visible = visibleRunningSubagents();
+  if (visible.length === 0) {
     latestCtx.ui.setWidget("subagent-status", undefined);
     if (widgetInterval) {
       clearInterval(widgetInterval);
@@ -816,7 +874,7 @@ function updateWidget() {
       return {
         invalidate() {},
         render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
+          return renderSubagentWidgetLines(visible, width);
         },
       };
     },
@@ -848,7 +906,7 @@ const SUBAGENT_CONTROL_TOOLS = ["ask_question"] as const;
  */
 function buildSubagentToolAllowlist(
   effectiveTools?: string,
-  opts?: { grantSpawning?: boolean },
+  opts?: { grantSpawning?: boolean; grantQuestion?: boolean },
 ): string | null {
   const requested = (effectiveTools ?? "")
     .split(",")
@@ -856,6 +914,7 @@ function buildSubagentToolAllowlist(
     .filter(Boolean);
 
   const grantSpawning = opts?.grantSpawning ?? false;
+  const grantQuestion = opts?.grantQuestion ?? true;
 
   // No explicit tool restriction and no spawning grant → don't pass --tools at
   // all (the child keeps its default toolset).
@@ -865,8 +924,10 @@ function buildSubagentToolAllowlist(
   if (grantSpawning) {
     for (const tool of SPAWNING_TOOLS) allow.add(tool);
   }
-  for (const tool of SUBAGENT_CONTROL_TOOLS) {
-    allow.add(tool);
+  if (grantQuestion) {
+    for (const tool of SUBAGENT_CONTROL_TOOLS) {
+      allow.add(tool);
+    }
   }
 
   return [...allow].join(",");
@@ -1020,6 +1081,16 @@ function uniqueRunningName(base: string, registryNames?: Set<string>): string {
   return `${base}-${n}`;
 }
 
+function reserveDetachedName(
+  requestedName: string | undefined,
+  agent: string,
+  registryNames: Set<string>,
+): string {
+  const name = uniqueRunningName(requestedName?.trim() || agent, registryNames);
+  reservedNames.add(name);
+  return name;
+}
+
 function resolveRunningByName(name: string):
   | { running: RunningSubagent }
   | { error: string } {
@@ -1113,7 +1184,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
   statusInterval = setInterval(() => {
-    if (runningSubagents.size === 0) {
+    if (visibleRunningSubagents().length === 0) {
       if (statusInterval) {
         clearInterval(statusInterval);
         statusInterval = null;
@@ -1138,7 +1209,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
       // wake the parent session on stalled/recovered transitions — the user is
       // working in the subagent's pane, and a steer message here would burn an
       // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
-      if (transition && !running.interactive) {
+      if (transition && !running.interactive && !running.detached) {
         transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
       }
     }
@@ -1174,6 +1245,7 @@ export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
+  visibleRunningSubagents,
   loadAgentDefaults,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
@@ -1189,11 +1261,14 @@ export const __test__ = {
   getToolExtensionPath,
   resolveRunningByName,
   uniqueRunningName,
+  reserveDetachedName,
   reservedNames,
   steerSubagent,
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  spawnPermissionError,
+  cancelRunningSubagent,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1221,7 +1296,7 @@ function startWidgetRefresh() {
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: Pick<ExtensionContext, "sessionManager" | "cwd" | "model" | "modelRegistry">,
-  options?: { surface?: string },
+  options?: { surface?: string; detached?: boolean },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1355,6 +1430,7 @@ async function launchSubagent(
       cli: "claude",
       sentinelFile,
       interactive: effectiveInteractive,
+      detached: options?.detached,
       statusState: createStatusState({
         source: "claude",
         startTimeMs: startTime,
@@ -1386,7 +1462,10 @@ async function launchSubagent(
   // spawning toolset), we disable global extension discovery and re-enable only
   // the extensions backing the whitelisted tools. Bare/fork spawns with no tool
   // restriction keep their full default toolset and all global extensions.
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
+  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, {
+    grantSpawning,
+    grantQuestion: !options?.detached,
+  });
 
   // Snapshot the fully-resolved sandbox beside the session file so a later
   // `subagent_message({ name })` resume can replay the exact same
@@ -1496,6 +1575,7 @@ async function launchSubagent(
     launchScriptFile,
     activityFile,
     interactive: effectiveInteractive,
+    detached: options?.detached,
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,
@@ -1579,15 +1659,16 @@ async function watchSubagent(
   signal: AbortSignal,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  const moduleSignal = getModuleAbortSignal();
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+    const result = await pollForExit(surface, AbortSignal.any([signal, moduleSignal]), {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
       onTick() {
         observeRunningSubagent(running);
-        deliverPendingQuestion(running);
+        if (!running.detached) deliverPendingQuestion(running);
       },
     });
 
@@ -1671,7 +1752,7 @@ async function watchSubagent(
     } catch {}
     runningSubagents.delete(running.id);
 
-    if (signal.aborted) {
+    if (signal.aborted || moduleSignal.aborted) {
       return {
         name,
         task,
@@ -1693,18 +1774,150 @@ async function watchSubagent(
   }
 }
 
+function spawnPermissionError(params: Partial<DetachedSubagentParams>): {
+  code: string;
+  message: string;
+} | null {
+  const permittedAgents = SUBAGENT_ALLOWLIST
+    ? [...SUBAGENT_ALLOWLIST]
+    : discoverAgentDefinitions().map((agent) => agent.name);
+  const permittedList = permittedAgents.join(", ") || "(none)";
+
+  if (!params.agent) {
+    return {
+      code: "agent required",
+      message: `You must specify which agent to spawn via the "agent" field. Available agents: ${permittedList}.`,
+    };
+  }
+  if (!new Set(permittedAgents).has(params.agent)) {
+    return {
+      code: SUBAGENT_ALLOWLIST ? "agent not in allowlist" : "unknown agent",
+      message:
+        `You may not spawn the "${params.agent}" agent — it is not ` +
+        `${SUBAGENT_ALLOWLIST ? "in your allowlist" : "a known agent"}. ` +
+        `Available agents: ${permittedList}.`,
+    };
+  }
+  return null;
+}
+
+async function spawnDetachedForRuntime(
+  rawParams: DetachedSubagentParams,
+  ctx: ExtensionContext,
+  runtime: PublicRuntime,
+): Promise<DetachedSubagentHandle> {
+  const params = { ...rawParams } as typeof SubagentParams.static;
+  const currentAgent = process.env.PI_SUBAGENT_AGENT;
+  if (params.agent && currentAgent && params.agent === currentAgent) {
+    throw new Error(
+      `You are the ${currentAgent} agent and cannot start another ${currentAgent}; complete the work directly.`,
+    );
+  }
+
+  const permissionError = spawnPermissionError(params);
+  if (permissionError) throw new Error(permissionError.message);
+  if (!isMuxAvailable()) throw new Error(`Subagents require Herdr or tmux. ${muxSetupHint()}`);
+  if (!ctx.sessionManager.getSessionFile()) {
+    throw new Error("No session file. Start pi with a persistent session to use subagents.");
+  }
+
+  const parentArtifactDir = getArtifactDir(
+    ctx.sessionManager.getSessionDir(),
+    ctx.sessionManager.getSessionId(),
+  );
+
+  // Programmatic callers often use deterministic names (for example an
+  // assignment id). Make explicit names collision-safe too, otherwise exact
+  // cancellation becomes ambiguous and the registry entry can be overwritten.
+  const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
+  params.name = reserveDetachedName(params.name, params.agent, registryNames);
+  const reservedName = params.name;
+
+  let running: RunningSubagent;
+  try {
+    running = await launchSubagent(params, ctx, { detached: true });
+  } finally {
+    reservedNames.delete(reservedName);
+  }
+
+  // A reload/session replacement may happen while launch waits for shell
+  // readiness. Never let that old closure take ownership of the new session.
+  if (!runtime.active || (globalThis as any)[PUBLIC_RUNTIME_KEY] !== runtime) {
+    runningSubagents.delete(running.id);
+    try { closeSurface(running.surface); } catch {}
+    throw new Error("The parent Pi session was replaced while the detached subagent was launching.");
+  }
+
+  registerName(parentArtifactDir, running.name, {
+    sessionFile: running.sessionFile,
+    sessionId: getSessionId(running.sessionFile),
+  });
+
+  const watcherAbort = new AbortController();
+  running.abortController = watcherAbort;
+  const result = watchSubagent(running, watcherAbort.signal).finally(() => {
+    updateWidget();
+  });
+
+  return {
+    id: running.id,
+    name: running.name,
+    sessionFile: running.sessionFile,
+    result,
+  };
+}
+
+function cancelRunningSubagent(
+  name: string,
+  close: (surface: string) => void = closeSurface,
+): boolean {
+  const requestedName = name.trim();
+  if (!requestedName) return false;
+  const matches = Array.from(runningSubagents.values()).filter(
+    (running) => running.name === requestedName,
+  );
+  if (matches.length === 0) return false;
+  if (matches.length > 1) {
+    throw new Error(`Ambiguous running subagent name "${requestedName}".`);
+  }
+
+  const running = matches[0];
+  running.abortController?.abort();
+  try { close(running.surface); } catch {}
+  runningSubagents.delete(running.id);
+  updateWidget();
+  return true;
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
+  latestCtx = null;
+  const publicRuntime: PublicRuntime = {
+    active: false,
+    spawnDetached(params) {
+      if (!this.active || !latestCtx) {
+        return Promise.reject(new Error("No active Pi session is available for detached subagents."));
+      }
+      return spawnDetachedForRuntime(params, latestCtx, this);
+    },
+    cancel(name) {
+      return cancelRunningSubagent(name);
+    },
+  };
+  (globalThis as any)[PUBLIC_RUNTIME_KEY] = publicRuntime;
+  const runtimeOwnsSession = () =>
+    publicRuntime.active && (globalThis as any)[PUBLIC_RUNTIME_KEY] === publicRuntime;
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
+    if ((globalThis as any)[PUBLIC_RUNTIME_KEY] !== publicRuntime) return;
     latestCtx = ctx;
+    publicRuntime.active = true;
     // pi runs multiple sessions in one process. A prior session's shutdown
-    // aborts the shared module poll-abort controller; install a fresh one so
-    // subagents spawned in this session aren't watched against a dead signal.
-    // See https://github.com/HazAT/pi-interactive-subagents/issues/5
-    const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    if (!prevAbort || prevAbort.signal.aborted) {
-      (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+    // aborts this module's poll controller; install a fresh one without ever
+    // mutating a newer /reload generation's controller.
+    if (moduleAbortController.signal.aborted) {
+      moduleAbortController = new AbortController();
+      (globalThis as any)[POLL_ABORT_KEY] = moduleAbortController;
     }
   });
 
@@ -1712,20 +1925,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", (_event, _ctx) => {
     if (widgetInterval) {
       clearInterval(widgetInterval);
+      if ((globalThis as any)[WIDGET_INTERVAL_KEY] === widgetInterval) {
+        (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+      }
       widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
     }
     if (statusInterval) {
       clearInterval(statusInterval);
+      if ((globalThis as any)[STATUS_INTERVAL_KEY] === statusInterval) {
+        (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+      }
       statusInterval = null;
-      (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
-    const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    if (moduleAbort) moduleAbort.abort();
+    moduleAbortController.abort();
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
+    latestCtx = null;
+    publicRuntime.active = false;
   });
 
   // The spawning tools are always registered here. Whether a child process can
@@ -1768,46 +1986,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Strict whitelist at every depth. The caller's permitted set is:
-        //   • a restricted subagent (PI_SUBAGENT_ALLOWED) → only its pinned agents;
-        //   • a top-level session → every discoverable agent, i.e. exactly what
-        //     `subagents_list` shows.
-        // Every spawn must name an agent in that set. The lone exception is a
-        // top-level `fork: true` clone, which has no role and inherits the
-        // caller's own already-trusted toolset. Without this guard a missing or
-        // unknown `agent` silently launches an unrestricted, full-toolset child.
-        const permittedAgents = SUBAGENT_ALLOWLIST
-          ? [...SUBAGENT_ALLOWLIST]
-          : discoverAgentDefinitions().map((a) => a.name);
-        const permittedSet = new Set(permittedAgents);
-        const permittedList = permittedAgents.join(", ") || "(none)";
-
-        if (!params.agent) {
+        // Enforce the same discovered-profile/PI_SUBAGENT_ALLOWED policy used
+        // by the detached programmatic API.
+        const permissionError = spawnPermissionError(params);
+        if (permissionError) {
           return {
-            content: [
-              {
-                type: "text",
-                text:
-                  `You must specify which agent to spawn via the "agent" field. ` +
-                  `Available agents: ${permittedList}.`,
-              },
-            ],
-            details: { error: "agent required" },
-          };
-        } else if (!permittedSet.has(params.agent)) {
-          return {
-            content: [
-              {
-                type: "text",
-                text:
-                  `You may not spawn the "${params.agent}" agent — it is not ` +
-                  `${SUBAGENT_ALLOWLIST ? "in your allowlist" : "a known agent"}. ` +
-                  `Available agents: ${permittedList}.`,
-              },
-            ],
-            details: {
-              error: SUBAGENT_ALLOWLIST ? "agent not in allowlist" : "unknown agent",
-            },
+            content: [{ type: "text", text: permissionError.message }],
+            details: { error: permissionError.code },
           };
         }
 
@@ -1879,6 +2064,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            if (!runtimeOwnsSession()) return;
             updateWidget(); // reflect removal from Map immediately
 
             const presentation = resolveResultPresentation(result, running.name);
@@ -1905,6 +2091,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
+            if (!runtimeOwnsSession()) return;
             updateWidget();
             pi.sendMessage(
               {
@@ -2323,6 +2510,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            if (!runtimeOwnsSession()) return;
             updateWidget();
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
@@ -2356,6 +2544,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
+            if (!runtimeOwnsSession()) return;
             updateWidget();
             pi.sendMessage(
               {

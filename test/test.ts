@@ -1291,6 +1291,23 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("bundles basecamp-worker with inherited model, fixed skills, and no nesting", async () => {
+    await withIsolatedAgentEnv(async () => {
+      const worker = testApi.loadAgentDefaults("basecamp-worker");
+      assert.ok(worker, "expected bundled basecamp-worker to be discoverable");
+      assert.equal(worker.model, undefined, "basecamp-worker should inherit the parent model");
+      assert.equal(worker.thinking, "high");
+      assert.equal(worker.tools, "read, write, edit, bash, web_search, web_fetch");
+      assert.equal(worker.skills, "basecamp-agent, basecamp");
+      assert.equal(worker.systemPromptMode, "append");
+      assert.equal(worker.autoExit, true);
+      assert.equal(worker.subagentAgents, undefined, "basecamp-worker must never receive spawning tools");
+      assert.match(worker.body ?? "", /exactly one required final reply/i);
+      assert.match(worker.body ?? "", /inherited `BASECAMP_PROFILE`/);
+      assert.match(worker.body ?? "", /Do not delegate/i);
+    });
+  });
+
   it("worker is granted the spawning toolset restricted to scout and researcher", () => {
     const worker = testApi.loadAgentDefaults("worker");
     assert.ok(worker, "expected bundled worker to be discoverable");
@@ -1383,6 +1400,20 @@ describe("subagent discovery", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
       "read,bash,web_search,ask_question",
+    );
+  });
+
+  it("omits ask_question from detached restricted child allowlists", () => {
+    const allowlist = testApi.buildSubagentToolAllowlist(
+      "read,write,edit,bash,web_search,web_fetch",
+      { grantQuestion: false },
+    );
+    assert.ok(allowlist);
+    const tools = new Set(allowlist.split(","));
+    assert.equal(tools.has("ask_question"), false);
+    assert.deepEqual(
+      [...tools],
+      ["read", "write", "edit", "bash", "web_search", "web_fetch"],
     );
   });
 
@@ -1921,6 +1952,31 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("exposes a stable process-global programmatic API and preserves tool registration", async () => {
+    const globalBefore = (globalThis as any).__pi_interactive_subagents;
+    assert.ok(globalBefore);
+    assert.equal(typeof globalBefore.registerToolExtension, "function");
+    assert.equal(typeof globalBefore.spawnDetached, "function");
+    assert.equal(typeof globalBefore.cancel, "function");
+
+    const extensionPath = `/tmp/pi-detached-test-${process.pid}.ts`;
+    globalBefore.registerToolExtension("detached_test_tool", extensionPath);
+    assert.equal((subagentsModule as any).__test__.getToolExtensionPath("detached_test_tool"), extensionPath);
+
+    const { api } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    assert.equal(
+      (globalThis as any).__pi_interactive_subagents,
+      globalBefore,
+      "extension registration must not replace references retained across reload",
+    );
+    await assert.rejects(
+      globalBefore.spawnDetached({ agent: "scout", task: "map it" }),
+      /No active Pi session/,
+    );
+    assert.throws(() => globalBefore.cancel("missing"), /No active Pi session/);
+  });
+
   it("always resumes subagents as autonomous (auto-exit, non-interactive tracking)", () => {
     const testApi = (subagentsModule as any).__test__;
 
@@ -2256,6 +2312,23 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("keeps detached children out of normal widget rows", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      runningMap.set("normal", makeRunning({ id: "normal", name: "Normal" }));
+      runningMap.set("detached", makeRunning({ id: "detached", name: "Detached", detached: true }));
+      assert.deepEqual(
+        testApi.visibleRunningSubagents().map((running: any) => running.name),
+        ["Normal"],
+      );
+    } finally {
+      runningMap.clear();
+    }
+  });
+
   it("uniqueRunningName suffixes defaulted names that collide with running subagents", () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
@@ -2297,6 +2370,52 @@ describe("subagent interruption", () => {
     } finally {
       runningMap.clear();
       reserved.clear();
+    }
+  });
+
+  it("suffixes concurrent explicit detached names for exact cancellation", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    testApi.reservedNames.clear();
+
+    try {
+      const registryNames = new Set<string>();
+      const first = testApi.reserveDetachedName("basecamp-assignment-123", "basecamp-worker", registryNames);
+      const second = testApi.reserveDetachedName("basecamp-assignment-123", "basecamp-worker", registryNames);
+      assert.equal(first, "basecamp-assignment-123");
+      assert.equal(second, "basecamp-assignment-123-2");
+    } finally {
+      testApi.reservedNames.clear();
+      runningMap.clear();
+    }
+  });
+
+  it("cancel aborts, closes, and removes one exact running child", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    const abortController = new AbortController();
+    const closed: string[] = [];
+
+    try {
+      runningMap.set("detached", makeRunning({
+        id: "detached",
+        name: "basecamp-assignment-123",
+        surface: "pane-detached",
+        detached: true,
+        abortController,
+      }));
+      assert.equal(
+        testApi.cancelRunningSubagent("basecamp-assignment-123", (surface: string) => closed.push(surface)),
+        true,
+      );
+      assert.equal(abortController.signal.aborted, true);
+      assert.deepEqual(closed, ["pane-detached"]);
+      assert.equal(runningMap.size, 0);
+      assert.equal(testApi.cancelRunningSubagent("basecamp-assignment-123", () => {}), false);
+    } finally {
+      runningMap.clear();
     }
   });
 
